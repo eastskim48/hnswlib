@@ -955,22 +955,19 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("to"),
             py::arg("bidirectional") = false
         )
-        .def("search_layer0_with_path_trace",
+        .def(
+            "search_layer0_path",
             [](Index<float>& index,
-               py::array_t<float, py::array::c_style | py::array::forcecast> query,
-               size_t efSearch) {
-
-                if (!index.index_inited || index.appr_alg == nullptr) {
-                    throw std::runtime_error("Index not initialized");
-                }
-
-                auto buf = query.request();
-                return index.appr_alg->searchLayer0WithPathTrace(buf.ptr, efSearch);
-            },
-            py::arg("query"),
-            py::arg("efSearch"),
-            "Return the layer-0 search path (pop order) as a list of node ids"
-        )
+             py::array_t<float> query,
+             size_t ef) {
+              auto buf = query.request();
+              return index.appr_alg->searchBaseLayerSTWithTrace(
+                  index.appr_alg->enterpoint_node_,
+                  buf.ptr,
+                  ef
+              );
+            }
+            )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))

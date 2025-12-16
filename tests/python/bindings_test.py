@@ -46,7 +46,7 @@ class RandomSelfTestCase(unittest.TestCase):
         # entry point에서 멀리 떨어진 query
         query = ep_vec + 100.0 * np.random.randn(dim).astype(np.float32)
 
-        print(p.search_layer0_with_path_trace(query, efSearch=1))
+        print(p.search_layer0_path(query, ef=10))
 
         # Query the elements for themselves and measure recall:
         labels, distances = p.knn_query(data1, k=1)

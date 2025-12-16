@@ -322,7 +322,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             candidate_set.pop();
             tableint current_node_id = current_node_pair.second;
 
-            // ✅ 여기서 기록
+            // ✅ 여기서 기록 (진짜 노드라고 pop 한거임)
             path.push_back(current_node_id);
 
             int *data = (int *) get_linklist0(current_node_id);
@@ -333,6 +333,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (visited_array[candidate_id] == visited_array_tag) continue;
 
                 visited_array[candidate_id] = visited_array_tag;
+                // Also record node in expanding phase
+                path.push_back(candidate_id);
                 char *currObj1 = getDataByInternalId(candidate_id);
                 dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
 
