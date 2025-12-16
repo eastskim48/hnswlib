@@ -222,6 +222,141 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
+    /*
+     *  -------------------------- BEGIN --------------------------
+     * Custom Logic Implementation for HNSW repairing approach
+    */
+
+    // ===== Layer0 full adjacency with distances (UNSAFE, read-only) =====
+    // Returns: map[node_id] -> vector of (neighbor_id, distance)
+    std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>
+    getLayer0NeighborsWithDistances() const {
+        std::unordered_map<tableint, std::vector<std::pair<tableint, float>>> adj;
+        adj.reserve(cur_element_count);
+
+        for (tableint u = 0; u < cur_element_count; u++) {
+            if (isMarkedDeleted(u)) continue;
+
+            linklistsizeint* ll = get_linklist0(u);
+            size_t sz = getListCount(ll);
+            tableint* data = (tableint*)(ll + 1);
+
+            std::vector<std::pair<tableint, float>> nbrs;
+            nbrs.reserve(sz);
+
+            char* u_data = getDataByInternalId(u);
+
+            for (size_t i = 0; i < sz; i++) {
+                tableint v = data[i];
+                char* v_data = getDataByInternalId(v);
+                float d = (float) fstdistfunc_(u_data, v_data, dist_func_param_);
+                nbrs.emplace_back(v, d);
+            }
+
+            adj.emplace(u, std::move(nbrs));
+        }
+
+        return adj;
+    }
+
+    // hnswalg.h (public, UNSAFE)
+    void forcedInsertLayer0Edge(
+        tableint from,
+        tableint to,
+        bool bidirectional = false
+    ) {
+        // layer 0 only
+        linklistsizeint* ll = get_linklist0(from);
+        size_t sz = getListCount(ll);
+        tableint* data = (tableint*)(ll + 1);
+
+        // 중복 방지
+        for (size_t i = 0; i < sz; i++) {
+            if (data[i] == to) return;
+        }
+
+        // ⚠️ no maxM0_ verification
+        data[sz] = to;
+        setListCount(ll, sz + 1);
+
+        if (bidirectional) {
+            forcedInsertLayer0Edge(to, from, false);
+        }
+    }
+
+    std::vector<tableint>
+    searchBaseLayerSTWithTrace(
+        tableint ep_id,
+        const void *data_point,
+        size_t ef
+    ) const {
+        std::vector<tableint> path;
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        // --- 초기화 (원본 그대로) ---
+        char* ep_data = getDataByInternalId(ep_id);
+        dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+        dist_t lowerBound = dist;
+
+        top_candidates.emplace(dist, ep_id);
+        candidate_set.emplace(-dist, ep_id);
+        visited_array[ep_id] = visited_array_tag;
+
+        // --- 실제 search 루프 ---
+        while (!candidate_set.empty()) {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            dist_t candidate_dist = -current_node_pair.first;
+
+            if (candidate_dist > lowerBound && top_candidates.size() == ef) {
+                break;
+            }
+
+            candidate_set.pop();
+            tableint current_node_id = current_node_pair.second;
+
+            // ✅ 여기서 기록
+            path.push_back(current_node_id);
+
+            int *data = (int *) get_linklist0(current_node_id);
+            size_t size = getListCount((linklistsizeint*)data);
+
+            for (size_t j = 1; j <= size; j++) {
+                tableint candidate_id = *(data + j);
+                if (visited_array[candidate_id] == visited_array_tag) continue;
+
+                visited_array[candidate_id] = visited_array_tag;
+                char *currObj1 = getDataByInternalId(candidate_id);
+                dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+
+                if (top_candidates.size() < ef || lowerBound > dist) {
+                    candidate_set.emplace(-dist, candidate_id);
+                    top_candidates.emplace(dist, candidate_id);
+
+                    if (top_candidates.size() > ef)
+                        top_candidates.pop();
+
+                    lowerBound = top_candidates.top().first;
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return path;
+    }
+
+    /*
+     *  -------------------------- END --------------------------
+     *
+    */
+
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -322,7 +457,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (bare_bone_search || 
+        if (bare_bone_search ||
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
@@ -403,7 +538,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                         _MM_HINT_T0);  ////////////////////////
 #endif
 
-                        if (bare_bone_search || 
+                        if (bare_bone_search ||
                             (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
@@ -826,7 +961,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::vector<data_t> getDataByLabel(labeltype label) const {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
-        
+
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
@@ -888,7 +1023,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     /*
     * Removes the deleted mark of the node, does NOT really change the current graph.
-    * 
+    *
     * Note: the method is not safe to use when replacement of deleted elements is enabled,
     *  because elements marked as deleted can be completely removed by addPoint
     */

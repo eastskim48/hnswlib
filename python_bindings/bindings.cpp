@@ -303,6 +303,18 @@ class Index {
         }
     }
 
+    py::object getLayer0NeighborsWithDistances() {
+        auto nodes = appr_alg->getLayer0NeighborsWithDistances();
+        return py::cast(nodes);
+    }
+
+    void forcedInsertLayer0Edge(
+        size_t from,
+        size_t to,
+        bool bidirectional = false
+    ) {
+        appr_alg->forcedInsertLayer0Edge(from, to, bidirectional);
+    }
 
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
@@ -934,6 +946,31 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("ids") = py::none(),
             py::arg("num_threads") = -1,
             py::arg("replace_deleted") = false)
+        .def("get_layer0_neighbors_with_distances",
+            &Index<float>::getLayer0NeighborsWithDistances
+        )
+        .def("forcedInsertLayer0Edge",
+            &Index<float>::forcedInsertLayer0Edge,
+            py::arg("from"),
+            py::arg("to"),
+            py::arg("bidirectional") = false
+        )
+        .def("search_layer0_with_path_trace",
+            [](Index<float>& index,
+               py::array_t<float, py::array::c_style | py::array::forcecast> query,
+               size_t efSearch) {
+
+                if (!index.index_inited || index.appr_alg == nullptr) {
+                    throw std::runtime_error("Index not initialized");
+                }
+
+                auto buf = query.request();
+                return index.appr_alg->searchLayer0WithPathTrace(buf.ptr, efSearch);
+            },
+            py::arg("query"),
+            py::arg("efSearch"),
+            "Return the layer-0 search path (pop order) as a list of node ids"
+        )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
