@@ -10,10 +10,11 @@ class RandomSelfTestCase(unittest.TestCase):
     def testRandomSelf(self):
 
         dim = 16
-        num_elements = 10000
+        num_elements = 10
 
         # Generating sample data
         data = np.float32(np.random.random((num_elements, dim)))
+        print(data)
 
         # Declaring index
         p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
@@ -42,7 +43,7 @@ class RandomSelfTestCase(unittest.TestCase):
         p.add_items(data1)
 
 
-        ep_vec = data1[20]
+        ep_vec = data[0]
         # entry point에서 멀리 떨어진 query
         query = ep_vec + 100.0 * np.random.randn(dim).astype(np.float32)
 
@@ -50,10 +51,11 @@ class RandomSelfTestCase(unittest.TestCase):
         print(len(trace))
 
         layout = p.get_layer0_neighbors_with_distances()
-        print(layout.get(1))
-        p.forced_insert_layer0_edge(1, 2, False)
+        print(layout)
+        p.forced_insert_layer0_edge(0, 2, False)
         layout = p.get_layer0_neighbors_with_distances()
-        print(layout.get(1))
+        print(layout.get(0))
+
 
         # Query the elements for themselves and measure recall:
         labels, distances = p.knn_query(data1, k=1)
@@ -78,5 +80,5 @@ class RandomSelfTestCase(unittest.TestCase):
         labels, distances = p.knn_query(data, k=1)
 
         self.assertAlmostEqual(np.mean(labels.reshape(-1) == np.arange(len(data))), 1.0, 3)
-        
+
         os.remove(index_path)

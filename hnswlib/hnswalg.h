@@ -117,12 +117,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         level_generator_.seed(random_seed);
         update_probability_generator_.seed(random_seed + 1);
 
-        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        // 각 노드마다 가지는 이웃 리스트의 크기
+        // 무제한 edge 추가를 위해 버퍼를 100으로 확장
+        size_links_level0_ = (maxM0_+ 100) * sizeof(tableint) + sizeof(linklistsizeint);
+        // 본인 + 이웃 크기인건가?
         size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
         offsetData_ = size_links_level0_;
         label_offset_ = size_links_level0_ + data_size_;
         offsetLevel0_ = 0;
 
+        // layer0의 최대 원소 개수 x 각 원소 당 데이터 크기만큼 메모리 할당
         data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory");
@@ -917,7 +921,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
-        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        // 무제한 edge 추가를 위해 버퍼를 100으로 확장
+        size_links_level0_ = (maxM0_ + 100) * sizeof(tableint) + sizeof(linklistsizeint);
         std::vector<std::mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
 
