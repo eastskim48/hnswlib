@@ -949,7 +949,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_layer0_neighbors_with_distances",
             &Index<float>::getLayer0NeighborsWithDistances
         )
-        .def("forcedInsertLayer0Edge",
+        .def("forced_insert_layer0_edge",
             &Index<float>::forcedInsertLayer0Edge,
             py::arg("from"),
             py::arg("to"),

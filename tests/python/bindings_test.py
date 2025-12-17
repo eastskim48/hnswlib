@@ -40,13 +40,6 @@ class RandomSelfTestCase(unittest.TestCase):
 
         print("Adding first batch of %d elements" % (len(data1)))
         p.add_items(data1)
-        p.get_layer0_neighbors_with_distances()
-
-        ep_vec = data1[20]
-        # entry point에서 멀리 떨어진 query
-        query = ep_vec + 100.0 * np.random.randn(dim).astype(np.float32)
-
-        print(p.search_layer0_path(query, ef=10))
 
         # Query the elements for themselves and measure recall:
         labels, distances = p.knn_query(data1, k=1)
