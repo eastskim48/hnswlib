@@ -357,6 +357,46 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return path;
     }
 
+    // 전체 HNSW 검색 과정을 따르되, base layer의 path만 기록
+    std::vector<tableint>
+    searchKnnWithLayer0Trace(
+        const void *query_data,
+        size_t ef
+    ) const {
+        if (cur_element_count == 0) return std::vector<tableint>();
+
+        // 1. Top layer에서 시작 (실제 searchKnn과 동일)
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        // 2. 각 layer를 greedy search로 내려감 (layer maxlevel_ → 1)
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                tableint *datal = (tableint *) (data + 1);
+                
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // 3. 최종 entry point로 base layer 검색 + path 기록
+        return searchBaseLayerSTWithTrace(currObj, query_data, ef);
+    }
+
     /*
      *  -------------------------- END --------------------------
      *

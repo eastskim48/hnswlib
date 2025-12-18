@@ -961,9 +961,19 @@ PYBIND11_PLUGIN(hnswlib) {
              py::array_t<float> query,
              size_t ef) {
               auto buf = query.request();
-              return index.appr_alg->searchBaseLayerSTWithTrace(
-                  index.appr_alg->enterpoint_node_,
-                  buf.ptr,
+              float* query_data = (float*)buf.ptr;
+              
+              // cosine space인 경우 정규화 필요
+              std::vector<float> normalized_query;
+              if (index.normalize) {
+                  normalized_query.resize(index.dim);
+                  index.normalize_vector(query_data, normalized_query.data());
+                  query_data = normalized_query.data();
+              }
+              
+              // ✅ 전체 HNSW 검색 과정을 따르며 base layer path 기록
+              return index.appr_alg->searchKnnWithLayer0Trace(
+                  query_data,
                   ef
               );
             }
