@@ -361,6 +361,51 @@ class Index {
         });
     }
 
+    /*
+     * [최적화] 배치 병렬 경로 탐색
+     * 쿼리셋을 통으로 받아 병렬로 search_layer0_path를 수행
+     * Returns: List[List[int]] (각 쿼리별 방문 노드 리스트의 리스트)
+     */
+    py::object searchLayer0PathBatch(
+        py::object input,
+        size_t ef,
+        int num_threads = -1
+    ) {
+        py::array_t < float, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        // 결과 저장용 벡터 (Row별로 가변 길이 벡터 저장)
+        std::vector<std::vector<hnswlib::tableint>> results(rows);
+
+        {
+            // GIL 해제하여 병렬 처리 허용
+            py::gil_scoped_release l;
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    // 각 스레드가 독립적으로 경로 탐색 후 results[row]에 저장
+                    results[row] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
+                });
+            } else {
+                // Cosine 유사도 등을 위한 정규화 처리
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    results[row] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
+                });
+            }
+        }
+
+        // C++ vector<vector> -> Python List[List] 자동 변환
+        return py::cast(results);
+    }
+
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
         if (std::find(std::begin(return_types), std::end(return_types), return_type) == std::end(return_types)) {
@@ -1027,6 +1072,12 @@ PYBIND11_PLUGIN(hnswlib) {
             &Index<float>::batchInsertLayer0Edges,
             py::arg("sources"),
             py::arg("targets"),
+            py::arg("num_threads") = -1
+        )
+        .def("search_layer0_path_batch",
+            &Index<float>::searchLayer0PathBatch,
+            py::arg("data"),
+            py::arg("ef"),
             py::arg("num_threads") = -1
         )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
