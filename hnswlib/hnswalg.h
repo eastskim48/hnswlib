@@ -288,6 +288,38 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
+    /*
+     * [최적화] Thread-safe 버전의 강제 엣지 삽입
+     * 기존 forcedInsertLayer0Edge에 Lock을 추가하여 병렬 처리가 가능하도록 함
+     */
+    void forcedInsertLayer0EdgeWithLock(
+        tableint from,
+        tableint to
+    ) {
+        // 1. 해당 노드(from)의 LinkList에 접근하기 위해 Lock 획득
+        std::unique_lock<std::mutex> lock(link_list_locks_[from]);
+
+        linklistsizeint* ll = get_linklist0(from);
+        unsigned short int sz = getListCount(ll);
+        tableint* data = (tableint*)(ll + 1);
+
+        // 2. 중복 체크 (이미 연결된 경우 스킵)
+        for (size_t i = 0; i < sz; i++) {
+            if (data[i] == to) return;
+        }
+
+        // 3. 엣지 추가 (메모리 버퍼 오버플로우 방지 체크 권장)
+        // 생성자에서 (maxM0_ + 100) 만큼 할당했으므로, 이 범위를 넘지 않도록 안전장치 추가
+        size_t allocated_size = maxM0_ + 100;
+        if (sz >= allocated_size) {
+            // 버퍼가 가득 찼다면 추가하지 않음 (혹은 에러 로그)
+            return;
+        }
+
+        data[sz] = to;
+        setListCount(ll, sz + 1);
+    }
+
     std::vector<tableint>
     searchBaseLayerSTWithTrace(
         tableint ep_id,

@@ -129,5 +129,40 @@ class DataIntegrityTestCase(unittest.TestCase):
         self.assertEqual(found_id, victim, "Victim을 찾지 못했습니다.")
         self.assertAlmostEqual(found_dist, 0.0, places=5, msg="자기 자신과의 거리가 0이 아닙니다.")
 
+
+    def test_4_search_path_validation(self):
+                
+        # Cosine space index
+        dim = 5
+        index = hnswlib.Index(space='cosine', dim=dim)
+        index.init_index(max_elements=10, ef_construction=50, M=4)
+
+        # 두 벡터 추가 (정규화 안 된 상태)
+        v1 = np.array([1.0, 0.0, 0.0, 0.0, 0.0])  # 길이 1
+        v2 = np.array([0.0, 1.0, 0.0, 0.0, 0.0])  # 길이 1, v1과 직교
+        v3 = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # v1과 45도 각도
+
+        index.add_items(np.array([v1, v2, v3]), ids=np.array([0, 1, 2]))
+
+        # 저장된 데이터 확인 (정규화되어 있어야 함)
+        stored = index.get_items([0, 1, 2])
+        print("Stored vectors (should be normalized):")
+        print(f"v1: {stored[0]}, norm: {np.linalg.norm(stored[0]):.4f}")
+        print(f"v2: {stored[1]}, norm: {np.linalg.norm(stored[1]):.4f}")
+        print(f"v3: {stored[2]}, norm: {np.linalg.norm(stored[2]):.4f}")
+
+        # Layer0 neighbors 확인
+        neighbors = index.get_layer0_neighbors_with_distances()
+        print("\nLayer0 neighbors with distances:")
+        for node_id, neighbor_list in neighbors.items():
+            print(f"Node {node_id}: {neighbor_list}")
+
+        # 예상 거리 계산
+        print("\n예상 거리 (cosine distance = 1 - cosine similarity):")
+        print(f"v1 <-> v2: {1.0 - np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)):.4f} (직교, ~1.0)")
+        print(f"v1 <-> v3: {1.0 - np.dot(v1, v3) / (np.linalg.norm(v1) * np.linalg.norm(v3)):.4f} (45도, ~0.293)")
+        print(f"v2 <-> v3: {1.0 - np.dot(v2, v3) / (np.linalg.norm(v2) * np.linalg.norm(v3)):.4f} (45도, ~0.293)")
+
+
 if __name__ == '__main__':
     unittest.main()

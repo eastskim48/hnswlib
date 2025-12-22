@@ -316,6 +316,51 @@ class Index {
         appr_alg->forcedInsertLayer0Edge(from, to, bidirectional);
     }
 
+    // 기존 forcedInsertLayer0Edge 아래에 추가
+
+    /*
+     * [최적화] 배치 병렬 엣지 삽입
+     * Python overhead를 제거하고 C++ 레벨에서 멀티스레드로 엣지를 연결
+     */
+    void batchInsertLayer0Edges(
+        py::object sources_obj,
+        py::object targets_obj,
+        int num_threads = -1
+    ) {
+        // 1. Python 객체를 C++ Vector로 변환 (Numpy 호환)
+        py::array_t<size_t, py::array::c_style | py::array::forcecast> sources_arr(sources_obj);
+        py::array_t<size_t, py::array::c_style | py::array::forcecast> targets_arr(targets_obj);
+
+        auto sources_req = sources_arr.request();
+        auto targets_req = targets_arr.request();
+
+        if (sources_req.size != targets_req.size) {
+            throw std::runtime_error("Sources and Targets must have the same length");
+        }
+
+        size_t count = sources_req.size;
+        size_t* sources_ptr = (size_t*)sources_req.ptr;
+        size_t* targets_ptr = (size_t*)targets_req.ptr;
+
+        // 2. 스레드 수 설정
+        if (num_threads <= 0) num_threads = num_threads_default;
+
+        // 3. GIL 해제 (병렬 처리를 위해 필수)
+        py::gil_scoped_release l;
+
+        // 4. ParallelFor를 사용하여 병렬 처리
+        ParallelFor(0, count, num_threads, [&](size_t i, size_t threadId) {
+            size_t u = sources_ptr[i]; // Hub (Source)
+            size_t v = targets_ptr[i]; // High-LID Node (Target)
+
+            // 아까 만든 Thread-Safe 함수 호출
+            // (주의: forcedInsertLayer0EdgeWithLock은 내부 ID(tableint)를 받음)
+            // Python에서 들어온 ID가 외부 Label이라면 내부 ID로 변환 필요하지만,
+            // 현재 repair 로직은 내부 ID 기준이므로 그대로 전달
+            appr_alg->forcedInsertLayer0EdgeWithLock((hnswlib::tableint)u, (hnswlib::tableint)v);
+        });
+    }
+
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
         if (std::find(std::begin(return_types), std::end(return_types), return_type) == std::end(return_types)) {
@@ -978,6 +1023,12 @@ PYBIND11_PLUGIN(hnswlib) {
               );
             }
             )
+        .def("batch_insert_layer0_edges",
+            &Index<float>::batchInsertLayer0Edges,
+            py::arg("sources"),
+            py::arg("targets"),
+            py::arg("num_threads") = -1
+        )
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))

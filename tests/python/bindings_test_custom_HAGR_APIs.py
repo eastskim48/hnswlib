@@ -52,7 +52,7 @@ class RandomSelfTestCase(unittest.TestCase):
 
         layout = p.get_layer0_neighbors_with_distances()
         print(layout)
-        p.forced_insert_layer0_edge(0, 2, False)
+        p.batch_insert_layer0_edges(0, 2, False)
         layout = p.get_layer0_neighbors_with_distances()
         print(layout.get(0))
 
