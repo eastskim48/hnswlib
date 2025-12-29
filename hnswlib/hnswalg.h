@@ -473,7 +473,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t t_start = std::numeric_limits<size_t>::max();
 
         // Optional multi-pop when stagnated (small, safe default)
-        const size_t BEAM_POP = 4;
+        const size_t BEAM_POP = 1;
         const size_t MIN_STEPS = 10;
 
         while (!candidate_set.empty()) {
@@ -547,7 +547,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                         // Adaptive beam (capacity) widening
                         if (ef_cur < ef_max) {
-                            ef_cur = ef_max;
+                            if (false && stagnated){
+                               ef_cur = ef_max;
+                            }
                             // NOTE: We do NOT shrink existing top_candidates; we only allow it to grow.
                             // lowerBound will loosen naturally as ef_cur grows.
                         }

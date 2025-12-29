@@ -449,6 +449,8 @@ class Index {
             }
 
             hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
+            if (ep < 0 || ep >= appr_alg->cur_element_count)
+                throw std::runtime_error("Invalid base-layer entry");
 
             std::priority_queue<std::pair<dist_t, hnswlib::labeltype>> result =
                 appr_alg->searchBaseLayerAdaptive(
