@@ -429,6 +429,175 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return searchBaseLayerSTWithTrace(currObj, query_data, ef);
     }
 
+    // ===== Adaptive Beam Search =====
+    std::priority_queue<std::pair<dist_t, labeltype>>
+    searchBaseLayerAdaptive(
+        tableint ep_id,
+        const void *data_point,
+        size_t k,
+        size_t ef_init,
+        size_t ef_max,
+        float delta_thr,   // interpreted in DISTANCE units (for cosine distance, e.g., 0.005~0.02)
+        size_t window
+    ) const {
+        size_t ef_cur = std::max<size_t>(ef_init, k);
+        size_t pop_count = 0;
+
+        // Track the BEST (minimum) distance to query we have seen so far.
+        dist_t best_min = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+        std::vector<dist_t> best_min_history;
+        best_min_history.reserve(256);
+        best_min_history.push_back(best_min);
+
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        // NOTE:
+        // - top_candidates keeps the ef_cur best points found so far (W).
+        //   With CompareByFirst, this is a max-heap by distance (worst-on-top).
+        // - candidate_set is a min-heap by distance implemented by pushing (-dist) and using CompareByFirst.
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        dist_t lowerBound = best_min; // worst distance in W (when W is full)
+
+        top_candidates.emplace(best_min, ep_id);
+        candidate_set.emplace(-best_min, ep_id);
+        visited_array[ep_id] = visited_array_tag;
+
+        // Stagnation state
+        bool stagnated = false;
+        size_t t_start = std::numeric_limits<size_t>::max();
+
+        // Optional multi-pop when stagnated (small, safe default)
+        const size_t BEAM_POP = 4;
+        const size_t MIN_STEPS = 10;
+
+        while (!candidate_set.empty()) {
+            // Stop condition (same shape as searchBaseLayerST):
+            // if closest candidate is worse than current worst-in-W and W is full => stop.
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            dist_t candidate_dist = -current_node_pair.first;
+            if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) {
+                break;
+            }
+
+            // Decide how many pops to do this iteration
+            size_t pops_this_round = stagnated ? BEAM_POP : 1;
+
+            for (size_t b = 0; b < pops_this_round && !candidate_set.empty(); b++) {
+                std::pair<dist_t, tableint> curr_el = candidate_set.top();
+                dist_t cur_dist = -curr_el.first;
+
+                if (cur_dist > lowerBound && top_candidates.size() == ef_cur) {
+                    break;
+                }
+
+                candidate_set.pop();
+                pop_count++;
+                tableint curr_id = curr_el.second;
+
+                // Expand neighbors of curr_id in layer0
+                linklistsizeint *ll = get_linklist0(curr_id);
+                size_t size = getListCount(ll);
+                tableint *data = (tableint *)(ll + 1);
+
+                for (size_t j = 0; j < size; j++) {
+                    tableint cand_id = data[j];
+                    if (visited_array[cand_id] == visited_array_tag) continue;
+                    visited_array[cand_id] = visited_array_tag;
+
+                    dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+
+                    // Update best-min distance (for stagnation detection)
+                    if (d < best_min) best_min = d;
+
+                    // Candidate acceptance rule (same as ST):
+                    if (top_candidates.size() < ef_cur || lowerBound > d) {
+                        candidate_set.emplace(-d, cand_id);
+                        top_candidates.emplace(d, cand_id);
+
+                        if (top_candidates.size() > ef_cur) {
+                            top_candidates.pop(); // remove worst
+                        }
+
+                        // Update lowerBound (worst distance among kept candidates)
+                        if (!top_candidates.empty()) {
+                            lowerBound = top_candidates.top().first;
+                        }
+                    }
+                }
+
+                // ---- Stagnation detection (distance-improvement plateau) ----
+                // Detect the FIRST time stagnation happens:
+                // after MIN_STEPS pops, if best_min does not improve by delta_thr within last `window` pops.
+                best_min_history.push_back(best_min);
+
+                if (!stagnated && pop_count >= MIN_STEPS && best_min_history.size() > window) {
+                    size_t t = best_min_history.size() - 1;
+                    size_t t0 = t - window;
+                    dist_t improvement = best_min_history[t0] - best_min; // positive if improved (distance decreased)
+
+                    if (improvement < (dist_t)delta_thr) {
+                        stagnated = true;
+                        t_start = pop_count;
+
+                        // Adaptive beam (capacity) widening
+                        if (ef_cur < ef_max) {
+                            ef_cur = ef_max;
+                            // NOTE: We do NOT shrink existing top_candidates; we only allow it to grow.
+                            // lowerBound will loosen naturally as ef_cur grows.
+                        }
+                    }
+                }
+            }
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+
+        // Convert to labeltype and return top-k (closest)
+        // top_candidates is worst-on-top; we need to keep only k smallest distances.
+        while (top_candidates.size() > k) top_candidates.pop();
+
+        std::priority_queue<std::pair<dist_t, labeltype>> result;
+        while (!top_candidates.empty()) {
+            result.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
+            top_candidates.pop();
+        }
+        return result;
+    }
+
+    tableint getBaseLayerEntry(const void* query) const {
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query, getDataByInternalId(currObj), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; --level) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                auto* ll = get_linklist(currObj, level);
+                size_t size = getListCount(ll);
+                tableint* data = (tableint*)(ll + 1);
+
+                for (size_t i = 0; i < size; i++) {
+                    tableint cand = data[i];
+                    dist_t d = fstdistfunc_(query, getDataByInternalId(cand), dist_func_param_);
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return currObj;
+    }
+
+
+
     /*
      *  -------------------------- END --------------------------
      *

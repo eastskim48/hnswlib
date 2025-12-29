@@ -1,4 +1,5 @@
 #include <iostream>
+#include <limits>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -405,6 +406,91 @@ class Index {
         // C++ vector<vector> -> Python List[List] 자동 변환
         return py::cast(results);
     }
+
+    py::object knnQueryAdaptive(
+        py::object input,
+        size_t k = 1,
+        size_t ef_init = 20,
+        size_t ef_max = 200,
+        float delta_thr = 0.01,
+        size_t window = 5,
+        int num_threads = -1
+    ) {
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != (size_t)dim)
+            throw std::runtime_error("Wrong dimensionality of the vectors");
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        if (rows <= (size_t)num_threads * 4) num_threads = 1;
+
+        hnswlib::labeltype* data_numpy_l = new hnswlib::labeltype[rows * k];
+        dist_t* data_numpy_d = new dist_t[rows * k];
+
+        // init with "empty"
+        for (size_t i = 0; i < rows * k; i++) {
+            data_numpy_l[i] = (hnswlib::labeltype)(-1);
+            data_numpy_d[i] = std::numeric_limits<dist_t>::infinity();
+        }
+
+        py::gil_scoped_release l;
+
+        ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+            // Prepare query pointer (normalize if cosine)
+            const float* query_ptr = (const float*)items.data(row);
+            std::vector<float> norm_query;
+            if (normalize) {
+                norm_query.resize(dim);
+                normalize_vector((float*)items.data(row), norm_query.data());
+                query_ptr = norm_query.data();
+            }
+
+            hnswlib::tableint ep = appr_alg->getBaseLayerEntry(query_ptr);
+
+            std::priority_queue<std::pair<dist_t, hnswlib::labeltype>> result =
+                appr_alg->searchBaseLayerAdaptive(
+                    ep,
+                    (const void*)query_ptr,
+                    k,
+                    ef_init,
+                    ef_max,
+                    delta_thr,
+                    window
+                );
+
+            // Fill output in ascending distance order (same as knn_query)
+            for (int i = (int)k - 1; i >= 0; i--) {
+                if (!result.empty()) {
+                    auto &tup = result.top();
+                    data_numpy_d[row * k + (size_t)i] = tup.first;
+                    data_numpy_l[row * k + (size_t)i] = tup.second;
+                    result.pop();
+                }
+            }
+        });
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) { delete[] (hnswlib::labeltype*)f; });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) { delete[] (dist_t*)f; });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { (ssize_t)(k * sizeof(hnswlib::labeltype)), (ssize_t)sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l
+            ),
+            py::array_t<dist_t>(
+                { rows, k },
+                { (ssize_t)(k * sizeof(dist_t)), (ssize_t)sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d
+            )
+        );
+    }
+
 
     py::object getData(py::object ids_ = py::none(), std::string return_type = "numpy") {
         std::vector<std::string> return_types{"numpy", "list"};
@@ -1030,6 +1116,16 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
+        .def("knn_query_adaptive",
+            &Index<float>::knnQueryAdaptive,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef_init") = 20,
+            py::arg("ef_max") = 200,
+            py::arg("delta_thr") = 0.01,
+            py::arg("window") = 5,
+            py::arg("num_threads") = -1
+        )
         .def("add_items",
             &Index<float>::addItems,
             py::arg("data"),

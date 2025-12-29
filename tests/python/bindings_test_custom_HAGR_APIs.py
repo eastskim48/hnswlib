@@ -14,7 +14,6 @@ class RandomSelfTestCase(unittest.TestCase):
 
         # Generating sample data
         data = np.float32(np.random.random((num_elements, dim)))
-        print(data)
 
         # Declaring index
         p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
@@ -48,17 +47,21 @@ class RandomSelfTestCase(unittest.TestCase):
         query = ep_vec + 100.0 * np.random.randn(dim).astype(np.float32)
 
         trace = p.search_layer0_path(query, 10)
-        print(len(trace))
-
         layout = p.get_layer0_neighbors_with_distances()
-        print(layout)
         p.batch_insert_layer0_edges(0, 2, False)
         layout = p.get_layer0_neighbors_with_distances()
-        print(layout.get(0))
-
-
         # Query the elements for themselves and measure recall:
         labels, distances = p.knn_query(data1, k=1)
+        labels_adapt, dists_adapt = p.knn_query_adaptive(
+            data1,
+            k=1,
+            ef_init=10,
+            ef_max=50,
+            delta_thr=0.01,
+            window=5
+        )
+        print(labels, distances)
+        print(labels_adapt, dists_adapt)
         self.assertAlmostEqual(np.mean(labels.reshape(-1) == np.arange(len(data1))), 1.0, 3)
 
         # Serializing and deleting the index:
