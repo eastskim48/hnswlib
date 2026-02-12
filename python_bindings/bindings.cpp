@@ -383,6 +383,55 @@ class Index {
 
         return std::make_tuple(sources, targets, distances);
     }
+       // FIXME: Integrate with the above getLayer0EdgesParallel to avoid code duplication
+        std::tuple<py::array_t<hnswlib::labeltype>, py::array_t<hnswlib::labeltype>, py::array_t<float>>
+    getLayerNEdgesParallel(int level) {
+        auto const& nodes_internal = appr_alg->getLayerNNeighborsWithDistances(level);
+        size_t num_nodes = nodes_internal.size();
+
+        // 1. 오프셋 및 내부 ID 목록 준비
+        std::vector<size_t> offsets(num_nodes + 1, 0);
+        std::vector<hnswlib::tableint> internal_ids;
+        internal_ids.reserve(num_nodes);
+
+        size_t idx = 0;
+        for (auto const& [u_int, nbrs] : nodes_internal) {
+            internal_ids.push_back(u_int);
+            offsets[idx + 1] = offsets[idx] + nbrs.size();
+            idx++;
+        }
+        size_t total_edges = offsets[num_nodes];
+
+        // 2. NumPy 배열 할당
+        py::array_t<hnswlib::labeltype> sources(total_edges);
+        py::array_t<hnswlib::labeltype> targets(total_edges);
+        py::array_t<float> distances(total_edges);
+
+        auto src_ptr = sources.mutable_data();
+        auto tgt_ptr = targets.mutable_data();
+        auto dist_ptr = distances.mutable_data();
+
+        // 3. GIL 해제 및 ParallelFor 실행
+        {
+            py::gil_scoped_release l; // Python GIL을 해제하여 진정한 병렬 처리 가능케 함
+            ParallelFor(0, num_nodes, num_threads_default, [&](size_t i, size_t threadId) {
+                hnswlib::tableint u_int = internal_ids[i];
+                hnswlib::labeltype u_label = appr_alg->getExternalLabel(u_int);
+
+                size_t current_offset = offsets[i];
+                auto const& nbrs = nodes_internal.at(u_int);
+
+                for (size_t j = 0; j < nbrs.size(); ++j) {
+                    size_t target_idx = current_offset + j;
+                    src_ptr[target_idx] = u_label;
+                    tgt_ptr[target_idx] = appr_alg->getExternalLabel(nbrs[j].first);
+                    dist_ptr[target_idx] = nbrs[j].second;
+                }
+            });
+        }
+
+        return std::make_tuple(sources, targets, distances);
+    }
 
 
     void forcedInsertLayer0Edge(
@@ -495,7 +544,7 @@ class Index {
             if (normalize == false) {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     // 1. 경로와 거리 계산 횟수 획득
-                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
+                    auto [path_internal, path_dist, count, ep] = appr_alg->searchKnnWithLayer0Trace((void*)items.data(row), ef);
                     dist_counts[row] = count;
 
                     // 2. 내부 ID -> 외부 라벨 변환
@@ -513,7 +562,7 @@ class Index {
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
 
                     // 1. 경로와 거리 계산 횟수 획득
-                    auto [path_internal, count] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
+                    auto [path_internal, path_dist, count, ep] = appr_alg->searchKnnWithLayer0Trace((void*)(norm_array.data() + start_idx), ef);
                     dist_counts[row] = count;
 
                     // 2. 내부 ID -> 외부 라벨 변환
@@ -1267,6 +1316,10 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_layer0_edges_parallel",
             &Index<float>::getLayer0EdgesParallel
         )
+        .def("get_layern_edges_parallel",
+            &Index<float>::getLayerNEdgesParallel,
+            py::arg("level")
+        )
         .def("forced_insert_layer0_edge",
             &Index<float>::forcedInsertLayer0Edge,
             py::arg("from"),
@@ -1288,12 +1341,26 @@ PYBIND11_PLUGIN(hnswlib) {
                   index.normalize_vector(query_data, normalized_query.data());
                   query_data = normalized_query.data();
               }
-              
-              // ✅ 전체 HNSW 검색 과정을 따르며 base layer path 기록
-              return index.appr_alg->searchKnnWithLayer0Trace(
+
+              auto [path, path_dist, dist_count, ep] =  index.appr_alg->searchKnnWithLayer0Trace(
                   query_data,
                   ef
               );
+
+                std::vector<hnswlib::labeltype> path_labels;
+                for (auto internal_id : path) {
+                    path_labels.push_back(index.appr_alg->getExternalLabel(internal_id));
+                }
+                std::vector<hnswlib::labeltype> path_dist_labels;
+                for (auto internal_id : path_dist) {
+                    path_dist_labels.push_back(index.appr_alg->getExternalLabel(internal_id));
+                }
+                return py::make_tuple(
+                    std::move(path_labels),
+                    std::move(path_dist_labels),
+                    dist_count,
+                    index.appr_alg->getExternalLabel(ep)
+                );
             }
             )
         .def("batch_insert_layer0_edges",

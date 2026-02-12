@@ -12,7 +12,10 @@ num_elements = 10000
 
 # Generating sample data
 data = np.float32(np.random.random((num_elements, dim)))
-ids = np.arange(num_elements)
+rng_global = np.random.RandomState(42)
+ids = rng_global.permutation(len(data)).tolist()
+
+# import pdb; pdb.set_trace()
 
 # Declaring index
 p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
@@ -21,7 +24,7 @@ p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
 p.init_index(max_elements=num_elements, ef_construction=200, M=16)
 
 # Element insertion (can be called several times):
-p.add_items(data, ids)
+p.add_items(data[ids], np.array(ids, dtype=np.int32))
 
 # Controlling the recall by setting ef:
 p.set_ef(50)  # ef should always be > k
@@ -39,3 +42,7 @@ print(f"Parameters passed to constructor:  space={p_copy.space}, dim={p_copy.dim
 print(f"Index construction: M={p_copy.M}, ef_construction={p_copy.ef_construction}")
 print(f"Index size is {p_copy.element_count} and index capacity is {p_copy.max_elements}")
 print(f"Search speed/quality trade-off parameter: ef={p_copy.ef}")
+
+paths = p.search_layer0_path(data[0], 100)
+edges = p.get_layern_edges_parallel(0)
+edges1 = p.get_layern_edges_parallel(1)

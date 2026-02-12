@@ -282,6 +282,59 @@ getLayer0NeighborsWithDistances() const {
         return adj;
     }
 
+        // FIXME: Integrate with the above getLayer0NeighborsWithDistances to avoid code duplication
+        std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>
+getLayerNNeighborsWithDistances(int level) const {
+        std::unordered_map<tableint, std::vector<std::pair<tableint, float>>> adj;
+        adj.reserve(cur_element_count);
+
+        // 스레드별로 결과를 담을 임시 벡터 (Lock 경합 방지)
+        std::vector<std::unordered_map<tableint, std::vector<std::pair<tableint, float>>>> local_adjs(omp_get_max_threads());
+
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            local_adjs[tid].reserve(cur_element_count / omp_get_num_threads());
+
+#pragma omp for schedule(dynamic, 64)
+            for (int u_idx = 0; u_idx < (int)cur_element_count; u_idx++) {
+                tableint u = (tableint)u_idx;
+                if (isMarkedDeleted(u)) continue;
+
+                if (level > element_levels_[u]) continue;
+
+                linklistsizeint* ll = get_linklist_at_level(u, level);
+                if (!ll) continue;
+
+                size_t sz = getListCount(ll);
+                tableint* data = (tableint*)(ll + 1);
+
+                std::vector<std::pair<tableint, float>> nbrs;
+                nbrs.reserve(sz);
+
+                char* u_data = getDataByInternalId(u);
+
+                for (size_t i = 0; i < sz; i++) {
+                    tableint v = data[i];
+                    char* v_data = getDataByInternalId(v);
+                    // 무거운 거리 계산을 병렬로 수행
+                    float d = (float)fstdistfunc_(u_data, v_data, dist_func_param_);
+                    nbrs.emplace_back(v, d);
+                }
+
+                local_adjs[tid].emplace(u, std::move(nbrs));
+            }
+        }
+
+        // 각 스레드의 결과를 하나로 병합 (이 부분은 순차적이지만 매우 빠름)
+        for (auto& local_map : local_adjs) {
+            adj.insert(std::make_move_iterator(local_map.begin()),
+                       std::make_move_iterator(local_map.end()));
+        }
+
+        return adj;
+    }
+
     // hnswalg.h (public, UNSAFE)
     void forcedInsertLayer0Edge(
         tableint from,
@@ -339,13 +392,14 @@ getLayer0NeighborsWithDistances() const {
         setListCount(ll, sz + 1);
     }
 
-    std::pair<std::vector<tableint>, size_t>
+    std::tuple<std::vector<tableint>, std::vector<tableint>, size_t, tableint>
     searchBaseLayerSTWithTrace(
         tableint ep_id,
         const void *data_point,
         size_t ef
     ) const {
         std::vector<tableint> path;
+        std::vector<tableint> path_dist; // 거리 계산된 노드 기록용
         size_t dist_count = 0; // 거리 계산 카운터
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -366,6 +420,7 @@ getLayer0NeighborsWithDistances() const {
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
         visited_array[ep_id] = visited_array_tag;
+        path_dist.push_back(ep_id);
 
         // --- 실제 search 루프 ---
         while (!candidate_set.empty()) {
@@ -395,6 +450,9 @@ getLayer0NeighborsWithDistances() const {
                 dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
                 dist_count++; // 카운트 증가
 
+                // ✅ Record nodes for which distance was computed
+                path_dist.push_back(candidate_id);
+
                 if (top_candidates.size() < ef || lowerBound > dist) {
                     candidate_set.emplace(-dist, candidate_id);
                     top_candidates.emplace(dist, candidate_id);
@@ -408,17 +466,17 @@ getLayer0NeighborsWithDistances() const {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return {path, dist_count}; // 경로와 카운트 함께 반환
+        return {path, path_dist, dist_count, ep_id}; // 경로와 카운트 함께 반환
     }
 
     // 전체 HNSW 검색 과정을 따르되, base layer의 path만 기록
-    std::pair<std::vector<tableint>, size_t>
+    std::tuple<std::vector<tableint>, std::vector<tableint>, size_t, tableint>
     searchKnnWithLayer0Trace(
         const void *query_data,
         size_t ef
     ) const {
         size_t total_dist_count = 0;
-        if (cur_element_count == 0) return {std::vector<tableint>(), 0};
+        if (cur_element_count == 0) return {std::vector<tableint>(), std::vector<tableint>(), total_dist_count, 0};
 
         // 1. Top layer에서 시작 (실제 searchKnn과 동일)
         tableint currObj = enterpoint_node_;
@@ -450,10 +508,10 @@ getLayer0NeighborsWithDistances() const {
             }
         }
         // 3. Base layer 탐색 호출 및 카운트 합산
-        auto [path, base_dist_count] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
-        total_dist_count += base_dist_count;
+        auto [path, path2, dist_count, ep] = searchBaseLayerSTWithTrace(currObj, query_data, ef);
+        total_dist_count += dist_count;
 
-        return {path, total_dist_count};
+        return {path, path2, total_dist_count, currObj};
     }
 
     // ===== Adaptive Beam Search =====
