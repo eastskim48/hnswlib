@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <unordered_set>
 #include <list>
+#include <map>
 #include <memory>
 #include <omp.h>
 
@@ -21,6 +22,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
     static const unsigned char DELETE_MARK = 0x01;
 
+    // std::map<tableint, int> external_id_to_cluster =
+    // cluster_id to number of elements in the cluster
+
     size_t max_elements_{0};
     mutable std::atomic<size_t> cur_element_count{0};  // current number of elements
     size_t size_data_per_element_{0};
@@ -31,6 +35,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t maxM0_{0};
     size_t ef_construction_{0};
     size_t ef_{ 0 };
+    mutable std::vector<int> logged_efs = std::vector<int>();
+    mutable std::vector<std::vector<int>> logged_topcands = std::vector<std::vector<int>>();
+
+    std::unordered_map<int, int> node_to_cluster = std::unordered_map<int, int>();
+    mutable std::vector<int> node_to_cluster_dense_cache_;
+    mutable size_t node_to_cluster_dense_cache_map_size_{0};
+    mutable size_t node_to_cluster_dense_cache_count_{0};
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -176,6 +187,38 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+    inline void refreshNodeClusterDenseCache() const {
+        const size_t cur_cnt = cur_element_count.load(std::memory_order_relaxed);
+        if (node_to_cluster_dense_cache_count_ == cur_cnt &&
+            node_to_cluster_dense_cache_map_size_ == node_to_cluster.size()) {
+            return;
+            }
+
+        node_to_cluster_dense_cache_.assign(cur_cnt, -1);
+        for (const auto& kv : node_to_cluster) {
+            const int node_id = kv.first;
+            if (node_id >= 0 && static_cast<size_t>(node_id) < cur_cnt) {
+                node_to_cluster_dense_cache_[static_cast<size_t>(node_id)] = kv.second;
+            }
+        }
+
+        node_to_cluster_dense_cache_count_ = cur_cnt;
+        node_to_cluster_dense_cache_map_size_ = node_to_cluster.size();
+    }
+
+    inline void invalidateNodeClusterDenseCache() {
+        node_to_cluster_dense_cache_map_size_ = static_cast<size_t>(-1);
+        node_to_cluster_dense_cache_count_ = static_cast<size_t>(-1);
+    }
+
+    inline void setNodeCluster(tableint node_id, int cluster_id) {
+        node_to_cluster[static_cast<int>(node_id)] = cluster_id;
+        if (static_cast<size_t>(node_id) < node_to_cluster_dense_cache_.size()) {
+            node_to_cluster_dense_cache_[static_cast<size_t>(node_id)] = cluster_id;
+        }
+        node_to_cluster_dense_cache_map_size_ = node_to_cluster.size();
     }
 
 
@@ -454,6 +497,7 @@ getLayerNNeighborsWithDistances(int level) const {
                 path_dist.push_back(candidate_id);
 
                 if (top_candidates.size() < ef || lowerBound > dist) {
+                    // 여기서 ef를 늘려주면 됨
                     candidate_set.emplace(-dist, candidate_id);
                     top_candidates.emplace(dist, candidate_id);
 
@@ -491,14 +535,14 @@ getLayerNNeighborsWithDistances(int level) const {
                 unsigned int *data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
                 tableint *datal = (tableint *) (data + 1);
-                
+
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
                     total_dist_count++; // 카운트 증가
-                    
+
                     if (d < curdist) {
                         curdist = d;
                         currObj = cand;
@@ -515,24 +559,26 @@ getLayerNNeighborsWithDistances(int level) const {
     }
 
     // ===== Adaptive Beam Search =====
-    std::priority_queue<std::pair<dist_t, labeltype>>
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayerAdaptive(
         tableint ep_id,
         const void *data_point,
         size_t k,
         size_t ef_init,
         size_t ef_max,
-        float delta_thr,   // interpreted in DISTANCE units (for cosine distance, e.g., 0.005~0.02)
-        size_t window
+        std::vector<int> query_cluster_ids = std::vector<int>()
     ) const {
         size_t ef_cur = std::max<size_t>(ef_init, k);
-        size_t pop_count = 0;
+        const size_t ef_cap = std::max(ef_cur, ef_max);
+        const size_t ef_step = ef_cur;
+        bool is_adapted = false;
 
-        // Track the BEST (minimum) distance to query we have seen so far.
+        std::unordered_set<int> query_cluster_set;
+        query_cluster_set.reserve(query_cluster_ids.size());
+        query_cluster_set.insert(query_cluster_ids.begin(), query_cluster_ids.end());
+        const bool use_cluster_overlap = !query_cluster_set.empty();
+
         dist_t best_min = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
-        std::vector<dist_t> best_min_history;
-        best_min_history.reserve(256);
-        best_min_history.push_back(best_min);
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -543,9 +589,9 @@ getLayerNNeighborsWithDistances(int level) const {
         //   With CompareByFirst, this is a max-heap by distance (worst-on-top).
         // - candidate_set is a min-heap by distance implemented by pushing (-dist) and using CompareByFirst.
         std::priority_queue<std::pair<dist_t, tableint>,
-            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+            std::vector<std::pair<dist_t, tableint> >, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>,
-            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+            std::vector<std::pair<dist_t, tableint> >, CompareByFirst> candidate_set;
 
         dist_t lowerBound = best_min; // worst distance in W (when W is full)
 
@@ -553,107 +599,127 @@ getLayerNNeighborsWithDistances(int level) const {
         candidate_set.emplace(-best_min, ep_id);
         visited_array[ep_id] = visited_array_tag;
 
-        // Stagnation state
-        bool stagnated = false;
-        size_t t_start = std::numeric_limits<size_t>::max();
+        // [CHANGED] membership ratio threshold (minimal choice: 10%)
+        constexpr double need_ratio = 0.2;
 
-        // Optional multi-pop when stagnated (small, safe default)
-        const size_t BEAM_POP = 4;
-        const size_t MIN_STEPS = 10;
+        std::unordered_map<int, uint16_t> top_cluster_freq;
+        top_cluster_freq.reserve(query_cluster_set.size());
+
+        // [CHANGED] match_nodes: number of nodes in top_candidates whose cluster ∈ query_cluster_set
+        size_t match_nodes = 0;
+
+        auto add_top_cluster = [&](tableint node) {
+            auto it = node_to_cluster.find((int) node);
+            if (it == node_to_cluster.end()) return;
+            const int cluster_id = it->second;
+            if (query_cluster_set.find(cluster_id) == query_cluster_set.end()) return;
+
+            uint16_t &cnt = top_cluster_freq[cluster_id];
+            cnt++;
+            // [CHANGED] count duplicates (membership)
+            match_nodes++;
+        };
+
+        auto remove_top_cluster = [&](tableint node) {
+            auto it = node_to_cluster.find((int) node);
+            if (it == node_to_cluster.end()) return;
+            const int cluster_id = it->second;
+            if (query_cluster_set.find(cluster_id) == query_cluster_set.end()) return;
+
+            auto fit = top_cluster_freq.find(cluster_id);
+            if (fit == top_cluster_freq.end()) return;
+
+            // [CHANGED] count duplicates (membership)
+            match_nodes--;
+
+            if (fit->second <= 1) {
+                top_cluster_freq.erase(fit);
+            } else {
+                fit->second--;
+            }
+        };
+
+        if (use_cluster_overlap) {
+            add_top_cluster(ep_id);
+        }
 
         while (!candidate_set.empty()) {
-            // Stop condition (same shape as searchBaseLayerST):
-            // if closest candidate is worse than current worst-in-W and W is full => stop.
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
-            if (candidate_dist > lowerBound && top_candidates.size() == ef_cur) {
-                break;
-            }
 
-            // Decide how many pops to do this iteration
-            size_t pops_this_round = stagnated ? BEAM_POP : 1;
+            if (top_candidates.size() == ef_cur && candidate_dist > lowerBound) {
+                if (!use_cluster_overlap) break;
 
-            for (size_t b = 0; b < pops_this_round && !candidate_set.empty(); b++) {
-                std::pair<dist_t, tableint> curr_el = candidate_set.top();
-                dist_t cur_dist = -curr_el.first;
+                // [CHANGED] membership ratio check instead of overlap_hit < need_cnt
+                const double denom = static_cast<double>(top_candidates.size());
+                const double membership = (denom > 0.0)
+                                              ? (static_cast<double>(match_nodes) / denom)
+                                              : 0.0;
 
-                if (cur_dist > lowerBound && top_candidates.size() == ef_cur) {
+                if (membership < need_ratio && ef_cur < ef_cap) {
+                    ef_cur = std::min(ef_cap, ef_cur + ef_step);
+                    is_adapted = true;
+                } else {
                     break;
                 }
+            }
 
-                candidate_set.pop();
-                pop_count++;
-                tableint curr_id = curr_el.second;
+            candidate_set.pop();
+            tableint curr_id = current_node_pair.second;
 
-                // Expand neighbors of curr_id in layer0
-                linklistsizeint *ll = get_linklist0(curr_id);
-                size_t size = getListCount(ll);
-                tableint *data = (tableint *)(ll + 1);
+            // Expand neighbors of curr_id in layer0
+            linklistsizeint *ll = get_linklist0(curr_id);
+            size_t size = getListCount(ll);
+            tableint *data = (tableint *) (ll + 1);
+            metric_distance_computations += size;
 
-                for (size_t j = 0; j < size; j++) {
-                    tableint cand_id = data[j];
-                    if (visited_array[cand_id] == visited_array_tag) continue;
-                    visited_array[cand_id] = visited_array_tag;
+            for (size_t j = 0; j < size; j++) {
+                tableint cand_id = data[j];
+                if (visited_array[cand_id] == visited_array_tag) continue;
+                visited_array[cand_id] = visited_array_tag;
 
-                    dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+                dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand_id), dist_func_param_);
+                if (d < best_min) best_min = d;
 
-                    // Update best-min distance (for stagnation detection)
-                    if (d < best_min) best_min = d;
+                // Candidate acceptance rule (same as ST)
+                if (top_candidates.size() < ef_cur || lowerBound > d) {
+                    candidate_set.emplace(-d, cand_id);
 
-                    // Candidate acceptance rule (same as ST):
-                    if (top_candidates.size() < ef_cur || lowerBound > d) {
-                        candidate_set.emplace(-d, cand_id);
-                        top_candidates.emplace(d, cand_id);
-
-                        if (top_candidates.size() > ef_cur) {
-                            top_candidates.pop(); // remove worst
-                        }
-
-                        // Update lowerBound (worst distance among kept candidates)
-                        if (!top_candidates.empty()) {
-                            lowerBound = top_candidates.top().first;
-                        }
+                    top_candidates.emplace(d, cand_id);
+                    if (use_cluster_overlap) {
+                        add_top_cluster(cand_id);
                     }
-                }
 
-                // ---- Stagnation detection (distance-improvement plateau) ----
-                // Detect the FIRST time stagnation happens:
-                // after MIN_STEPS pops, if best_min does not improve by delta_thr within last `window` pops.
-                best_min_history.push_back(best_min);
-
-                if (!stagnated && pop_count >= MIN_STEPS && best_min_history.size() > window) {
-                    size_t t = best_min_history.size() - 1;
-                    size_t t0 = t - window;
-                    dist_t improvement = best_min_history[t0] - best_min; // positive if improved (distance decreased)
-
-                    if (improvement < (dist_t)delta_thr) {
-                        stagnated = true;
-                        t_start = pop_count;
-
-                        // Adaptive beam (capacity) widening
-                        if (ef_cur < ef_max) {
-                            ef_cur = ef_max;
-                            // NOTE: We do NOT shrink existing top_candidates; we only allow it to grow.
-                            // lowerBound will loosen naturally as ef_cur grows.
+                    if (top_candidates.size() > ef_cur) {
+                        if (use_cluster_overlap) {
+                            remove_top_cluster(top_candidates.top().second);
                         }
+                        top_candidates.pop();
+                    }
+
+                    if (!top_candidates.empty()) {
+                        lowerBound = top_candidates.top().first;
                     }
                 }
             }
         }
 
-        visited_list_pool_->releaseVisitedList(vl);
+        logged_efs.push_back(static_cast<int>(ef_cur));
 
-        // Convert to labeltype and return top-k (closest)
-        // top_candidates is worst-on-top; we need to keep only k smallest distances.
-        while (top_candidates.size() > k) top_candidates.pop();
-
-        std::priority_queue<std::pair<dist_t, labeltype>> result;
-        while (!top_candidates.empty()) {
-            result.emplace(top_candidates.top().first, getExternalLabel(top_candidates.top().second));
-            top_candidates.pop();
+        std::priority_queue<std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_snapshot = top_candidates;
+        std::vector<int> topcand_nodes;
+        topcand_nodes.reserve(top_snapshot.size());
+        while (!top_snapshot.empty()) {
+            topcand_nodes.push_back(static_cast<int>(top_snapshot.top().second));
+            top_snapshot.pop();
         }
-        return result;
+        logged_topcands.push_back(std::move(topcand_nodes));
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
     }
+
 
     tableint getBaseLayerEntry(const void* query) const {
         tableint currObj = enterpoint_node_;
@@ -779,6 +845,8 @@ getLayerNNeighborsWithDistances(int level) const {
         const void *data_point,
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
+        bool use_adaptive_ef = false,
+        std::vector<int> query_cluster_ids = std::vector<int>(),
         BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -811,7 +879,12 @@ getLayerNNeighborsWithDistances(int level) const {
 
             bool flag_stop_search;
             if (bare_bone_search) {
-                flag_stop_search = candidate_dist > lowerBound;
+                if (use_adaptive_ef && candidate_dist > lowerBound) {
+                    flag_stop_search = candidate_dist > lowerBound;
+                }
+                else {
+                    flag_stop_search = candidate_dist > lowerBound;
+                }
             } else {
                 if (stop_condition) {
                     flag_stop_search = stop_condition->should_stop_search(candidate_dist, lowerBound);
@@ -1735,8 +1808,9 @@ getLayerNNeighborsWithDistances(int level) const {
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
-        std::priority_queue<std::pair<dist_t, labeltype >> result;
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor *isIdAllowed = nullptr, bool use_adaptive_ef = false,
+             std::vector<int> query_cluster_ids = std::vector<int>()) const {
+        std::priority_queue<std::pair<dist_t, labeltype> > result;
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
@@ -1771,13 +1845,19 @@ getLayerNNeighborsWithDistances(int level) const {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
-        if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+        if (use_adaptive_ef) {
+            top_candidates = searchBaseLayerAdaptive(currObj, query_data, k, ef_, 300, query_cluster_ids);
         } else {
-            top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+            // if (bare_bone_search) {
+            //     top_candidates = searchBaseLayerST<true, true>(
+            //         currObj, query_data, std::max(ef_, k), isIdAllowed);
+            // } else {
+            //     top_candidates = searchBaseLayerST<false, true>(
+            //         currObj, query_data, std::max(ef_, k), isIdAllowed);
+            // }
+            top_candidates = searchBaseLayerAdaptive(currObj, query_data, k, ef_, 300, std::vector<int>());
         }
+
 
         while (top_candidates.size() > k) {
             top_candidates.pop();

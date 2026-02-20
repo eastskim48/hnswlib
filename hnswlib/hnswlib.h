@@ -59,6 +59,8 @@ static uint64_t xgetbv(unsigned int index) {
 // Adapted from https://github.com/Mysticial/FeatureDetector
 #define _XCR_XFEATURE_ENABLED_MASK  0
 
+# include <map>
+
 static bool AVXCapable() {
     int cpuInfo[4];
 
@@ -189,7 +191,8 @@ class AlgorithmInterface {
     virtual void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) = 0;
 
     virtual std::priority_queue<std::pair<dist_t, labeltype>>
-        searchKnn(const void*, size_t, BaseFilterFunctor* isIdAllowed = nullptr) const = 0;
+    searchKnn(const void*, size_t, BaseFilterFunctor* isIdAllowed = nullptr, bool use_adaptive_ef = false,
+          std::vector<int> query_knn_clusters = std::vector<int>()) const = 0;
 
     // Return k nearest neighbor in the order of closer fist
     virtual std::vector<std::pair<dist_t, labeltype>>
